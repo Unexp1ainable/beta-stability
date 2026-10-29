@@ -97,6 +97,188 @@ def parse_verifier_names(verifier_names):
 
     return parsed_verifiers
 
+
+
+def prepare_embeddings(config):
+    """
+    Handle all shared preparation tasks common to both algorithms.
+
+    Args:
+        config: Configuration dictionary
+
+    Returns:
+        dict: Common data needed by both algorithms
+    """
+
+    data_params = config['data']
+    images_dir = data_params.get('images_dir', None)
+    if images_dir == "None":
+        images_dir = None
+
+    data_params['images_dir'] = images_dir
+    algorithm_type = config['algorithm_type']
+    algorithm_config = config.get(algorithm_type, {})
+
+    # 1. Resolve embeddings config and load all pickles.
+    #
+    # Config schema (new, preferred):
+    #   data:
+    #     embeddings:
+    #       miewid:
+    #         file: /path/to/miewid.pickle
+    #       megadescriptor:
+    #         file: /path/to/megadescriptor.pickle
+    #
+    # Back-compat: legacy `data.embedding_file: <path>` is auto-promoted to
+    # `data.embeddings.miewid.file = <path>` if no explicit miewid section is
+    # already present. Mixing both forms is allowed; explicit sections win.
+    #
+    # All embeddings must cover the same uuid SET. The first one (in dict
+    # insertion order) provides the canonical uuid ORDERING used for GT,
+    # preprocess_data, and the all_node2uuid map.
+    logger.info("Loading embeddings and preprocessing data...")
+
+    embeddings_cfg = {}
+    legacy_path = data_params.get('embedding_file')
+    if legacy_path is not None:
+        embeddings_cfg['miewid'] = {'file': legacy_path}
+    explicit_embeddings = data_params.get('embeddings') or {}
+    if not isinstance(explicit_embeddings, dict):
+        raise ValueError(
+            f"data.embeddings must be a dict of {{name: {{file: ...}}}}, "
+            f"got {type(explicit_embeddings).__name__}"
+        )
+    for name, spec in explicit_embeddings.items():
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"data.embeddings.{name} must be a dict (got {type(spec).__name__})"
+            )
+        if 'file' not in spec:
+            raise KeyError(f"data.embeddings.{name} is missing required 'file' key")
+        embeddings_cfg[name] = dict(spec)
+
+    if not embeddings_cfg:
+        raise KeyError(
+            "config must specify at least one embedding in `data.embeddings` "
+            "or via legacy `data.embedding_file`"
+        )
+
+    # Load each pickle exactly once.
+    loaded_embeddings = {}  # name -> (np.ndarray, list[uuid])
+    for name, spec in embeddings_cfg.items():
+        path = spec['file']
+        logger.info(f"Loading embedding '{name}' from {path}")
+        embs, ids = load_pickle(path)
+        loaded_embeddings[name] = (np.asarray(embs), list(ids))
+
+    # First-loaded embedding provides the canonical uuid ordering.
+    uuid_source_name = next(iter(loaded_embeddings))
+    uuids = loaded_embeddings[uuid_source_name][1]
+    logger.info(
+        f"Loaded {len(loaded_embeddings)} embedding(s): "
+        f"{list(loaded_embeddings.keys())}; uuid ordering from '{uuid_source_name}'"
+    )
+
+    # All embeddings must cover the same uuid set.
+    ref_uuid_set = set(uuids)
+    for name, (_, other_uuids) in loaded_embeddings.items():
+        if name == uuid_source_name:
+            continue
+        other_set = set(other_uuids)
+        if other_set != ref_uuid_set:
+            missing = ref_uuid_set - other_set
+            extra = other_set - ref_uuid_set
+            raise KeyError(
+                f"Embedding '{name}' uuid set differs from '{uuid_source_name}': "
+                f"{len(missing)} missing, {len(extra)} extra. "
+                "All embeddings must cover the same set of uuids."
+            )
+
+    # Null name_keys means the annotations carry no identities: the run
+    # clusters them and evaluates nothing.
+    name_keys = data_params['name_keys']
+    filter_key = '__'.join(name_keys) if name_keys else None
+
+    # Support different preprocessing formats
+    format_type = data_params['format']  # 'old' or 'drone'
+    id_key = data_params['id_key']
+
+    # Create field_filters from any {field}_list entries in config
+    field_filters = {}
+    for key in data_params:
+        if key.endswith('_list'):
+            field_name = key[:-5]  # Remove '_list' suffix
+            field_filters[field_name] = data_params[key]
+
+    df = preprocess_data(
+        data_params['annotation_file'],
+        name_keys=name_keys,
+        convert_names_to_ids=True,
+        n_filter_min=data_params['n_filter_min'],
+        n_filter_max=data_params['n_filter_max'],
+        images_dir=data_params['images_dir'],
+        embedding_uuids=uuids,
+        id_key=id_key,
+        format=format_type,
+        field_filters=field_filters,
+        print_func=logger.info
+    )
+
+    if filter_key is not None:
+        print_intersect_stats(df, individual_key=filter_key)
+
+    filtered_df = df[df[id_key].isin(uuids)]
+
+    # node2uuid mapping for ALL primary-pickle entries (used for thresholding).
+    all_node2uuid = dict(enumerate(uuids))
+
+    if filter_key is None:
+        logger.info("No data.name_keys: running without ground truth, so no "
+                    "evaluation will be reported")
+        gt_clustering, gt_node2cid = None, None
+        node2uuid = generate_node2uuid(filtered_df, id_key)
+    else:
+        logger.info("Setting up ground truth and validation...")
+        gt_clustering, gt_node2cid, node2uuid = generate_gt_clusters(
+            filtered_df, filter_key, id_key)
+
+    # Check for single annotation - no clustering needed
+    if len(node2uuid) == 1:
+        logger.info("Only 1 annotation found - skipping Beta Stability clustering")
+        raise SingleAnnotationException(node2uuid, gt_clustering, gt_node2cid)
+
+    # 3. Per-embedding processing: filter to filtered_df row order, apply PCA,
+    # register under its own name in embeddings_dict and unfiltered_embeddings_dict.
+    logger.info("Setting up embeddings...")
+    distance_power = algorithm_config['distance_power']
+
+    embeddings_dict = {}
+    unfiltered_embeddings_dict = {}
+
+    for name, (raw_embeddings, raw_uuids) in loaded_embeddings.items():
+        uuid_to_row = {u: i for i, u in enumerate(raw_uuids)}
+        # Re-index to filtered_df order.
+        filtered_arr = np.asarray(
+            [raw_embeddings[uuid_to_row[uuid]] for uuid in filtered_df[id_key]]
+        )
+        # Re-index to primary uuid order (so all_node2uuid lookups align).
+        unfiltered_arr = np.asarray(
+            [raw_embeddings[uuid_to_row[uuid]] for uuid in uuids]
+        )
+
+        embeddings_dict[name] = lazy(
+            (lambda fa=filtered_arr, n2u=node2uuid, dp=distance_power:
+                Embeddings(fa, n2u, distance_power=dp, print_func=logger.info))
+        )
+        unfiltered_embeddings_dict[name] = lazy(
+            (lambda ua=unfiltered_arr, n2u=all_node2uuid, dp=distance_power:
+                Embeddings(ua, n2u, distance_power=dp, print_func=logger.info))
+        )
+
+    # 9. Return common data
+    return embeddings_dict
+
+    
 def prepare_common(config):
     """
     Handle all shared preparation tasks common to both algorithms.

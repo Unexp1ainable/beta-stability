@@ -61,3 +61,7 @@ ui/node_modules
 /beta_stability/share
 # Superseded code, kept out of the repository
 /beta_stability/old/
+inputs
+runs
+configs
+logs

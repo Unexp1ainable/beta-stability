@@ -24,6 +24,10 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "tqdm",
+    "marimo>=0.25.2",
+    "torch>=2.14.1",
+    "torch-geometric>=2.8.1",
+    "lightning>=2.6.6",
 ]
 
 [project.optional-dependencies]
@@ -80,6 +84,12 @@ extend-exclude = ["beta_stability/exploratory", "internal"]
 # parameters unused.
 "beta_stability/metrics/cluster_validator.py" = ["ARG001"]
 "beta_stability/metrics/cluster_metrics.py" = ["ARG001"]
+
+[dependency-groups]
+dev = [
+    "tensorboard>=2.21.0",
+    "tensorboardx>=2.6.5",
+]
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "B", "C4", "SIM", "RET", "ARG", "PIE", "PERF", "RUF"]

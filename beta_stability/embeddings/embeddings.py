@@ -243,3 +243,10 @@ class Embeddings(object):
 
         self.print_func(f"Calculated distances in: {time.time() - start_time:.6f} seconds")
         return set(result)
+
+    def __str__(self):
+        return (
+            f"Embeddings(count={len(self.embeddings)}, "
+            f"dimension={self.embeddings.shape[1] if self.embeddings.ndim > 1 else 0}, "
+            f"distance_power={self.distance_power})"
+        )
